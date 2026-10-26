@@ -6,143 +6,237 @@
     <style>
         body { margin: 0; overflow: hidden; font: 13px sans-serif; background: #111; color: #fff; }
         #p { position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,.9); padding: 15px; border-radius: 8px; max-width: 320px; border: 1px solid #333; z-index: 10; }
-        #o { background: #000; padding: 8px; font-family: monospace; font-size: 11px; color: #0fc; max-height: 150px; overflow-y: auto; word-break: break-all; margin: 10px 0; border: 1px solid #444; }
-        button, label { background: #f80; color: #fff; border: none; padding: 8px; width: 100%; cursor: pointer; font-weight: bold; margin-top: 5px; display: block; text-align: center; border-radius: 4px; box-sizing: border-box; text-decoration: none;}
+        #o { background: #000; padding: 8px; font-family: monospace; font-size: 11px; color: #0fc; max-height: 150px; overflow-y: auto; word-break: break-all; margin: 10px 0; border: 1px solid #444; white-space: pre-wrap; }
+        button, label { background: #f80; color: #fff; border: none; padding: 8px; width: 100%; cursor: pointer; font-weight: bold; margin-top: 5px; display: block; text-align: center; border-radius: 6px; }
         button:hover, label:hover { background: #e70; }
-        #drop-zone { position: absolute; top:0; left:0; width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,0.6); font-size: 24px; pointer-events: none; opacity: 0; transition: opacity 0.3s; z-index: 5; }
+        #drop-zone { position: absolute; top:0; left:0; width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,0.6); font-size: 24px; pointer-events: none; opacity:0; transition: opacity .15s ease; }
+        #file-input { display: none; }
     </style>
-    <!-- High-reliability Cloudflare CDNs for core graphics engine -->
-    <script src="https://cloudflare.com"></script>
-    <script src="https://jsdelivr.net"></script>
-    <script src="https://jsdelivr.net"></script>
 </head>
 <body>
 
-<div id="drop-zone">Drop your .obj file here</div>
+<div id="drop-zone">Drop your .obj or .glb file here</div>
 <div id="c"></div>
 
 <div id="p">
     <b style="color:#f80">CM2 Micro-Voxelizer</b><br>
     <span style="font-size:11px; color:#aaa">Grid: 1 Voxel = 0.1 cm (0.1 Stud)</span>
-    
-    <label for="file-input">Choose .obj File</label>
-    <input type="file" id="file-input" accept=".obj" style="display:none">
-    
-    <div id="o">Drag & drop or select an .obj model...</div>
-    <button onclick="navigator.clipboard.writeText(document.getElementById('o').innerText)">Copy CM2 String</button>
-    <button style="background:#444" onclick="location.reload()">Clear Scene</button>
+
+    <label for="file-input">Choose .obj/.glb File</label>
+    <input type="file" id="file-input" accept=".obj,.glb">
+
+    <div id="o">Drag & drop or select a .obj/.glb model...</div>
+    <button id="copy-button">Copy CM2 String</button>
+    <button style="background:#444" id="clear-button">Clear Scene</button>
 </div>
 
-<script>
-const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.001, 10);
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/loaders/GLTFLoader.js';
+import { OBJLoader } from 'https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/loaders/OBJLoader.js';
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.001, 10);
 camera.position.set(0.05, 0.05, 0.05);
+
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('c').appendChild(renderer.domElement);
-const ctr = new THREE.OrbitControls(camera, renderer.domElement);
+
+const ctr = new OrbitControls(camera, renderer.domElement);
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(1, 2, 1); scene.add(dl);
+const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+dl.position.set(1, 2, 1);
+scene.add(dl);
 
-// Micro-scale grid helper (1mm step size in Three.js units)
-const gh = new THREE.GridHelper(0.2, 200, 0x444444, 0x222222); gh.position.y = -0.0001; scene.add(gh);
+const gh = new THREE.GridHelper(0.2, 200, 0x444444, 0x222222);
+gh.position.y = -0.0001;
+scene.add(gh);
 
+const voxelSize = 0.001;
+const maxTargetResolution = 35;
 let currentVoxels = [];
-const voxelSize = 0.001; // 0.1 cm (1 mm) in Three.js world space
+let currentModel = null;
 
-function processMesh(object) {
+function clearCurrentModel() {
+    if (currentModel) {
+        scene.remove(currentModel);
+        currentModel = null;
+    }
+}
+
+function clearVoxelVisualization() {
     currentVoxels.forEach(v => scene.remove(v));
     currentVoxels = [];
+}
 
-    // Scale mesh down to match the 0.1 cm scale constraint safely
-    const box = new THREE.Box3().setFromObject(object);
+function prepareModel(root) {
+    if (!root) return;
+
+    root.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(root);
     const size = box.getSize(new THREE.Vector3());
-    const maxDim = Math.max(size.x, size.y, size.z);
-    
-    // Limits the resolution grid to ~35 voxels along the longest axis to prevent browser crashes
-    const maxTargetResolution = 35; 
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+
     const scaleFactor = (maxTargetResolution * voxelSize) / maxDim;
-    object.scale.set(scaleFactor, scaleFactor, scaleFactor);
-    
-    const newBox = new THREE.Box3().setFromObject(object);
-    const center = newBox.getCenter(new THREE.Vector3());
-    object.position.sub(center);
-    object.position.y -= newBox.min.y;
+    root.scale.setScalar(scaleFactor);
 
-    object.updateMatrixWorld(true);
+    const scaledBox = new THREE.Box3().setFromObject(root);
+    const center = scaledBox.getCenter(new THREE.Vector3());
 
-    const targetBox = new THREE.Box3().setFromObject(object);
-    let cm2Strings = [];
-    
-    const minX = Math.floor(targetBox.min.x / voxelSize);
-    const maxX = Math.ceil(targetBox.max.x / voxelSize);
-    const minY = Math.floor(targetBox.min.y / voxelSize);
-    const maxY = Math.ceil(targetBox.max.y / voxelSize);
-    const minZ = Math.floor(targetBox.min.z / voxelSize);
-    const maxZ = Math.ceil(targetBox.max.z / voxelSize);
+    root.position.sub(center);
+    root.position.y -= scaledBox.min.y;
+    root.updateMatrixWorld(true);
+}
 
-    const raycaster = new THREE.Raycaster();
-    raycaster.firstHitOnly = true;
+function voxelizeModel(root) {
+    clearVoxelVisualization();
 
-    const geo = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
-    const mat = new THREE.MeshStandardMaterial({ color: 0xff8040, roughness: 0.4 });
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x000000 });
+    const bounds = new THREE.Box3().setFromObject(root);
+    if (!bounds.isEmpty()) {
+        const minX = Math.floor(bounds.min.x / voxelSize);
+        const maxX = Math.ceil(bounds.max.x / voxelSize);
+        const minY = Math.floor(bounds.min.y / voxelSize);
+        const maxY = Math.ceil(bounds.max.y / voxelSize);
+        const minZ = Math.floor(bounds.min.z / voxelSize);
+        const maxZ = Math.ceil(bounds.max.z / voxelSize);
 
-    // 3D Space raycasting calculation loop
-    for(let x = minX; x <= maxX; x++) {
-        for(let y = minY; y <= maxY; y++) {
-            for(let z = minZ; z <= maxZ; z++) {
-                const pos = new THREE.Vector3(x * voxelSize, y * voxelSize, z * voxelSize);
-                
-                // Fire a ray upwards to determine if coordinates lie inside the solid geometry mesh boundary
-                raycaster.set(pos, new THREE.Vector3(0, 1, 0));
-                const intersections = raycaster.intersectObject(object, true);
-                
-                if (intersections.length % 2 !== 0 || (intersections.length > 0 && intersections.distance < voxelSize)) {
-                    const vMesh = new THREE.Mesh(geo, mat);
-                    vMesh.position.copy(pos);
-                    vMesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat));
-                    scene.add(vMesh);
-                    currentVoxels.push(vMesh);
+        const raycaster = new THREE.Raycaster();
+        const geo = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+        const mat = new THREE.MeshStandardMaterial({ color: 0xff8040, roughness: 0.4 });
+        const edgeMat = new THREE.LineBasicMaterial({ color: 0x000000 });
+        const cm2Strings = [];
 
-                    // Maps grid position into your clean CM2 coordinate system format
-                    cm2Strings.push(`14,0,${x},${y},${z},255+128+64+2`);
+        for (let x = minX; x <= maxX; x++) {
+            for (let y = minY; y <= maxY; y++) {
+                for (let z = minZ; z <= maxZ; z++) {
+                    const pos = new THREE.Vector3(x * voxelSize, y * voxelSize, z * voxelSize);
+                    raycaster.set(pos, new THREE.Vector3(0, 1, 0));
+                    const intersections = raycaster.intersectObject(root, true);
+
+                    const isInside = intersections.length % 2 !== 0 || (intersections.length > 0 && intersections[0].distance < voxelSize);
+                    if (isInside) {
+                        const vMesh = new THREE.Mesh(geo, mat);
+                        vMesh.position.copy(pos);
+                        vMesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat));
+                        scene.add(vMesh);
+                        currentVoxels.push(vMesh);
+
+                        cm2Strings.push(`14,0,${x},${y},${z},255+128+64+2`);
+                    }
                 }
             }
         }
-    }
 
-    if (cm2Strings.length > 0) {
-        document.getElementById('o').innerText = cm2Strings.join(';');
-        ctr.target.set(0, 0.01, 0);
+        if (cm2Strings.length > 0) {
+            document.getElementById('o').innerText = cm2Strings.join(';');
+            ctr.target.set(0, 0.01, 0);
+        } else {
+            document.getElementById('o').innerText = 'Error: Could not voxelize. Make sure your mesh file is solid / watertight.';
+        }
     } else {
-        document.getElementById('o').innerText = "Error: Could not voxelize. Make sure your mesh file is solid / watertight.";
+        document.getElementById('o').innerText = 'Error: Could not read any geometry from the model.';
     }
 }
 
-function loadFile(file) {
-    document.getElementById('o').innerText = "Processing mesh to micro-grid...";
-    const reader = new FileReader();
-    reader.onload = function (e) {
-        try {
-            const loader = new THREE.OBJLoader();
-            const obj = loader.parse(e.target.result);
-            processMesh(obj);
-        } catch(err) {
-            document.getElementById('o').innerText = "Geometry Read Error: " + err.message;
+async function loadFile(file) {
+    if (!file) return;
+
+    document.getElementById('o').innerText = 'Processing mesh to micro-grid...';
+
+    try {
+        const fileName = file.name.toLowerCase();
+        let loadedScene;
+
+        if (fileName.endsWith('.obj')) {
+            const loader = new OBJLoader();
+            const text = await file.text();
+            loadedScene = loader.parse(text);
+        } else if (fileName.endsWith('.glb')) {
+            const loader = new GLTFLoader();
+            const buffer = await file.arrayBuffer();
+            const gltf = await loader.parseAsync(buffer, '');
+            loadedScene = gltf.scene;
+        } else {
+            throw new Error('Unsupported file type. Please upload a .obj or .glb model.');
         }
-    };
-    reader.readAsText(file);
+
+        clearCurrentModel();
+        prepareModel(loadedScene);
+
+        currentModel = loadedScene;
+        scene.add(currentModel);
+        voxelizeModel(currentModel);
+    } catch (err) {
+        clearCurrentModel();
+        clearVoxelVisualization();
+        document.getElementById('o').innerText = 'Geometry Read Error: ' + err.message;
+    }
+}
+
+function clearScene() {
+    clearCurrentModel();
+    clearVoxelVisualization();
+    document.getElementById('o').innerText = 'Drag & drop or select a .obj/.glb model...';
 }
 
 const dz = document.getElementById('drop-zone');
-window.addEventListener('dragover', (e) => { e.preventDefault(); dz.style.opacity = 1; });
-window.addEventListener('dragleave', () => { dz.style.opacity = 0; });
-window.addEventListener('drop', (e) => { e.preventDefault(); dz.style.opacity = 0; if(e.dataTransfer.files.length) loadFile(e.dataTransfer.files); });
-document.getElementById('file-input').addEventListener('change', (e) => { if(e.target.files.length) loadFile(e.target.files); });
+window.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dz.style.opacity = 1;
+});
 
-function an() { requestAnimationFrame(an); ctr.update(); renderer.render(scene, camera); } an();
-window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+window.addEventListener('dragleave', () => {
+    dz.style.opacity = 0;
+});
+
+window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dz.style.opacity = 0;
+    if (e.dataTransfer.files && e.dataTransfer.files.length) {
+        loadFile(e.dataTransfer.files[0]);
+    }
+});
+
+document.getElementById('file-input').addEventListener('change', (e) => {
+    if (e.target.files && e.target.files.length) {
+        loadFile(e.target.files[0]);
+    }
+});
+
+document.getElementById('copy-button').addEventListener('click', async () => {
+    const text = document.getElementById('o').innerText.trim();
+    if (!text || text.startsWith('Error:') || text.startsWith('Drag &') || text.startsWith('Processing')) {
+        return;
+    }
+
+    try {
+        await navigator.clipboard.writeText(text);
+        document.getElementById('o').innerText = text + '\n\nCopied to clipboard.';
+    } catch (err) {
+        document.getElementById('o').innerText = text + '\n\nClipboard copy failed. Select the text and copy manually.';
+    }
+});
+
+document.getElementById('clear-button').addEventListener('click', () => {
+    clearScene();
+    location.reload();
+});
+
+function animate() {
+    requestAnimationFrame(animate);
+    ctr.update();
+    renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
 </script>
 </body>
 </html>
